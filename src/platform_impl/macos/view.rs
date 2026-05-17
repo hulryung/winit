@@ -132,15 +132,6 @@ pub struct ViewState {
     forward_key_to_app: Cell<bool>,
 
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
-
-    /// halite-0.30.13-ime patch (winit #3095 fix):
-    /// True for exactly one keyDown immediately after the input source
-    /// changed. The insertText callback consults this so a single-char
-    /// insertText that races ahead of macOS binding the new IME (typical
-    /// of Korean's first jamo after a language toggle) is treated as a
-    /// preedit start instead of a commit.
-    just_switched_input_source: Cell<bool>,
-
     accepts_first_mouse: bool,
 
     // Weak reference because the window keeps a strong reference to the view
@@ -416,103 +407,22 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
-            // halite diagnostic — once-per-process check that macOS
-            // sees us as conforming to NSTextInputClient. If false,
-            // setMarkedText is never invoked → IME race.
-            unsafe {
-                use objc2::msg_send;
-                use objc2::runtime::AnyProtocol;
-                use std::sync::Once;
-                static ONCE: Once = Once::new();
-                ONCE.call_once(|| {
-                    if let Some(proto) = AnyProtocol::get("NSTextInputClient") {
-                        let conforms: bool =
-                            msg_send![self, conformsToProtocol: proto];
-                        tracing::info!(
-                            conforms,
-                            "halite-ime: WinitView conformsToProtocol(NSTextInputClient)",
-                        );
-                        let ctx_nil: bool = {
-                            let ctx: Option<Retained<objc2_app_kit::NSTextInputContext>> =
-                                self.inputContext();
-                            ctx.is_none()
-                        };
-                        tracing::info!(
-                            input_context_is_none = ctx_nil,
-                            "halite-ime: inputContext()",
-                        );
-                    } else {
-                        tracing::warn!("halite-ime: AnyProtocol::get(NSTextInputClient) returned None");
-                    }
-                });
-            }
-
-            tracing::info!(
-                text = %string,
-                len = string.len(),
-                has_marked = unsafe { self.hasMarkedText() },
-                ime_enabled = self.is_ime_enabled(),
-                is_control,
-                just_switched = self.ivars().just_switched_input_source.get(),
-                ime_state = ?self.ivars().ime_state.get(),
-                "halite-ime: insertText",
-            );
-
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
-                // halite-0.30.13-ime patch (winit PR #4478):
-                // Clear marked text synchronously here so any second
-                // insertText: dispatched in the same interpretKeyEvents
-                // batch (Korean Space-without-preedit double-commit bug)
-                // doesn't see stale state.
+                // halite: cherry-pick of winit PR #4478 — clear marked
+                // text synchronously so a second insertText in the same
+                // interpretKeyEvents batch doesn't double-commit
+                // (alacritty #8079 Korean Space).
                 *self.ivars().marked_text.borrow_mut() =
                     NSMutableAttributedString::new();
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
-            } else if self.is_ime_enabled() && !is_control && {
-                // Single Hangul jamo (initial/medial/final + compat
-                // jamo + extended-A/B) routed via insertText with NO
-                // marked text. That's the winit #3095 first-jamo race:
-                // macOS Korean IME occasionally hands the first
-                // composing keystroke to insertText instead of
-                // setMarkedText, so it would commit into our PTY and
-                // then the actual composed syllable (e.g. "한") also
-                // commits — producing "ㅎ한" instead of "한". Dropping
-                // the bare jamo keeps the composed syllable that
-                // follows correct.
-                let cp = string
-                    .chars()
-                    .next()
-                    .filter(|_| string.chars().count() == 1)
-                    .map(|c| c as u32)
-                    .unwrap_or(0);
-                (0x1100..=0x11FF).contains(&cp)
-                    || (0x3130..=0x318F).contains(&cp)
-                    || (0xA960..=0xA97F).contains(&cp)
-                    || (0xD7B0..=0xD7FF).contains(&cp)
-            } {
-                self.ivars().just_switched_input_source.set(false);
-                tracing::info!(
-                    text = %string,
-                    "halite-ime: dropping lone Hangul jamo insertText (#3095)",
-                );
-                // Bump ime_state out of Ground so keyDown's
-                // `_ => old_ime_state != current` check considers this
-                // IME-handled and DOESN'T emit a raw KeyboardInput.
-                // Without this the dropped jamo still leaks to the app
-                // as a Character KeyboardInput event.
-                self.ivars().ime_state.set(ImeState::Preedit);
-                self.queue_event(WindowEvent::Ime(Ime::Preedit(
-                    String::new(),
-                    None,
-                )));
             } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
-                // halite-0.30.13-ime patch (winit PR #4478):
-                // ASCII / digit "trigger" key that fires inside the same
-                // keyDown as the commit (e.g. `한5` → commit "한" then
-                // insert "5"). Without this, doCommandBySelector swallows
-                // the trigger because we're still in Committed state.
+                // halite: cherry-pick of winit PR #4478 — trigger key in
+                // the same keyDown as the commit (e.g. `한5` → commit
+                // "한" then insert "5") was being swallowed because
+                // doCommandBySelector early-returned on Committed.
                 self.ivars().forward_key_to_app.set(true);
             }
         }
@@ -522,11 +432,11 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
-            // halite-0.30.13-ime patch (winit PR #4478): removed the
-            // blanket `if ImeState::Committed { return; }` early-return
-            // so trigger keys committed via doCommandBySelector are not
-            // swallowed (Alacritty #6942). The insertText branch above
-            // already handles the same-event-as-commit case.
+            // halite: cherry-pick of winit PR #4478 — removed the blanket
+            // `if ImeState::Committed { return; }` early-return so trigger
+            // keys committed via doCommandBySelector aren't swallowed
+            // (alacritty #6942). The insertText branch above already
+            // handles the same-event-as-commit case.
 
             self.ivars().forward_key_to_app.set(true);
 
@@ -546,30 +456,10 @@ declare_class!(
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
-                    tracing::info!(
-                        from = %*prev_input_source,
-                        to = %current_input_source,
-                        "halite-ime: input source change detected",
-                    );
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    // halite-0.30.13-ime patch (winit #3095 fix v3):
-                    // Forcibly reset macOS's NSTextInputContext so the
-                    // new IME's marked-text session starts clean and
-                    // the next keystroke is correctly routed through
-                    // setMarkedText (instead of insertText, the bug).
-                    // The same-keyDown first jamo is sacrificed (no
-                    // way to retroactively re-route it through the
-                    // freshly-reset IME), so just drop it. Without
-                    // this, that first key leaks as raw
-                    // KeyboardInput("ᄒ") which the app prints to grid.
-                    self.ivars().ime_state.set(ImeState::Ground);
-                    self.ivars().just_switched_input_source.set(true);
+                    self.ivars().ime_state.set(ImeState::Disabled);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
-                    self.queue_event(WindowEvent::Ime(Ime::Enabled));
-                    if let Some(ctx) = self.inputContext() {
-                        ctx.discardMarkedText();
-                    }
                 }
             }
 
@@ -616,12 +506,6 @@ declare_class!(
                     is_synthetic: false,
                 });
             }
-
-            // halite-0.30.13-ime patch (winit #3095 fix):
-            // The latch is strictly one-shot — clear it at end of
-            // keyDown so the next event is processed normally even if
-            // insertText didn't fire for this keyDown.
-            self.ivars().just_switched_input_source.set(false);
         }
 
         #[method(keyUp:)]
@@ -931,7 +815,6 @@ impl WinitView {
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
-            just_switched_input_source: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),
@@ -950,22 +833,6 @@ impl WinitView {
         }
 
         *this.ivars().input_source.borrow_mut() = this.current_input_source();
-
-        // halite-0.30.13-ime diagnostic: does macOS see WinitView as
-        // conforming to NSTextInputClient?
-        unsafe {
-            use objc2::msg_send;
-            use objc2::runtime::AnyProtocol;
-            if let Some(proto) = AnyProtocol::get("NSTextInputClient") {
-                let conforms: bool = msg_send![&*this, conformsToProtocol: proto];
-                tracing::info!(
-                    conforms,
-                    "halite-ime: WinitView conformsToProtocol(NSTextInputClient)",
-                );
-            } else {
-                tracing::warn!("halite-ime: AnyProtocol::get(NSTextInputClient) returned None");
-            }
-        }
 
         this
     }
@@ -1027,17 +894,6 @@ impl WinitView {
         }
         self.ivars().ime_allowed.set(ime_allowed);
         if self.ivars().ime_allowed.get() {
-            // halite-0.30.13-ime patch: when enabling IME, also flip
-            // ime_state out of Disabled so `is_ime_enabled()` (which
-            // reads ime_state, not ime_allowed) starts returning true
-            // immediately. Otherwise the very first keyDown skips
-            // every IME branch because is_ime_enabled() is still false
-            // — that's the surface symptom of #3095 even without a
-            // language toggle.
-            if self.ivars().ime_state.get() == ImeState::Disabled {
-                self.ivars().ime_state.set(ImeState::Ground);
-                self.queue_event(WindowEvent::Ime(Ime::Enabled));
-            }
             return;
         }
 

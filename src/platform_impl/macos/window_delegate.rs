@@ -643,24 +643,18 @@ fn new_window(
         #[allow(deprecated)]
         view.setWantsBestResolutionOpenGLSurface(!attrs.platform_specific.disallow_hidpi);
 
-        // halite-0.30.13-ime patch (winit #3095 fix v6 — structural):
-        // Match WezTerm's sequence: setContentView BEFORE setWantsLayer.
-        // The original order made AppKit acquire the NSTextInputContext
-        // for a still-detached layer-backed view; macOS Korean IME then
-        // routed the first jamo through insertText: (commit path)
-        // instead of setMarkedText: (preedit path). WezTerm and
-        // Terminal.app attach the view first, then flip wantsLayer,
-        // and don't hit the race.
-        window.setContentView(Some(&view));
-        window.setInitialFirstResponder(Some(&view));
-
         // On Mojave, views automatically become layer-backed shortly after being added to
         // a window. Changing the layer-backedness of a view breaks the association between
-        // the view and its associated OpenGL context. We explicitly make the view
-        // layer-backed AFTER attaching it.
+        // the view and its associated OpenGL context. To work around this, on Mojave we
+        // explicitly make the view layer-backed up front so that AppKit doesn't do it
+        // itself and break the association with its context.
         if unsafe { NSAppKitVersionNumber }.floor() > NSAppKitVersionNumber10_12 {
             view.setWantsLayer(true);
         }
+
+        // Configure the new view as the "key view" for the window
+        window.setContentView(Some(&view));
+        window.setInitialFirstResponder(Some(&view));
 
         if attrs.transparent {
             window.setOpaque(false);
@@ -792,14 +786,6 @@ impl WindowDelegate {
         // before it transitions.
         if attrs.visible {
             if attrs.active {
-                // halite-0.30.13-ime patch (winit #3095 fix v6 — structural):
-                // Force the app active BEFORE makeKeyAndOrderFront,
-                // matching WezTerm. If the app isn't active when its
-                // first window becomes key, macOS Korean IME doesn't
-                // complete the client-active handshake and routes the
-                // first jamo through insertText: instead of
-                // setMarkedText:.
-                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
                 // Tightly linked with `app_state::window_activation_hack`
                 window.makeKeyAndOrderFront(None);
             } else {
