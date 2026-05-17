@@ -465,6 +465,16 @@ declare_class!(
                     text = %string,
                     "halite-ime: dropping lone Hangul jamo insertText (#3095)",
                 );
+                // Bump ime_state out of Ground so keyDown's
+                // `_ => old_ime_state != current` check considers this
+                // IME-handled and DOESN'T emit a raw KeyboardInput.
+                // Without this the dropped jamo still leaks to the app
+                // as a Character KeyboardInput event.
+                self.ivars().ime_state.set(ImeState::Preedit);
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(
+                    String::new(),
+                    None,
+                )));
             } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
                 // halite-0.30.13-ime patch (winit PR #4478):
                 // ASCII / digit "trigger" key that fires inside the same
