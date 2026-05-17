@@ -415,6 +415,38 @@ declare_class!(
             };
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
+
+            // halite diagnostic — once-per-process check that macOS
+            // sees us as conforming to NSTextInputClient. If false,
+            // setMarkedText is never invoked → IME race.
+            unsafe {
+                use objc2::msg_send;
+                use objc2::runtime::AnyProtocol;
+                use std::sync::Once;
+                static ONCE: Once = Once::new();
+                ONCE.call_once(|| {
+                    if let Some(proto) = AnyProtocol::get("NSTextInputClient") {
+                        let conforms: bool =
+                            msg_send![self, conformsToProtocol: proto];
+                        tracing::info!(
+                            conforms,
+                            "halite-ime: WinitView conformsToProtocol(NSTextInputClient)",
+                        );
+                        let ctx_nil: bool = {
+                            let ctx: Option<Retained<objc2_app_kit::NSTextInputContext>> =
+                                self.inputContext();
+                            ctx.is_none()
+                        };
+                        tracing::info!(
+                            input_context_is_none = ctx_nil,
+                            "halite-ime: inputContext()",
+                        );
+                    } else {
+                        tracing::warn!("halite-ime: AnyProtocol::get(NSTextInputClient) returned None");
+                    }
+                });
+            }
+
             tracing::info!(
                 text = %string,
                 len = string.len(),
