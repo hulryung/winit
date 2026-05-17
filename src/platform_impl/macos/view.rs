@@ -415,6 +415,16 @@ declare_class!(
             };
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
+            tracing::info!(
+                text = %string,
+                len = string.len(),
+                has_marked = unsafe { self.hasMarkedText() },
+                ime_enabled = self.is_ime_enabled(),
+                is_control,
+                just_switched = self.ivars().just_switched_input_source.get(),
+                ime_state = ?self.ivars().ime_state.get(),
+                "halite-ime: insertText",
+            );
 
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
@@ -492,6 +502,11 @@ declare_class!(
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
+                    tracing::info!(
+                        from = %*prev_input_source,
+                        to = %current_input_source,
+                        "halite-ime: input source change detected",
+                    );
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
                     // halite-0.30.13-ime patch (winit #3095 fix):
