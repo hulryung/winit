@@ -442,27 +442,22 @@ declare_class!(
                 && self.is_ime_enabled()
                 && !is_control
             {
-                // halite-0.30.13-ime patch (winit #3095 fix):
-                // The very first keyDown after a language toggle often
-                // arrives at insertText (not setMarkedText) because the
-                // new IME hasn't fully bound yet. Without this branch
-                // we'd silently commit it, producing the observed
-                // "first char committed instead of starting composition"
-                // bug (e.g. typing ㅎ ㅏ ㄴ commits "ㅎ" and only "한"
-                // composes). Instead, synthesize a preedit start so the
-                // app sees `Ime::Preedit(<char>)`; subsequent keys then
-                // come via setMarkedText and compose normally.
+                // halite-0.30.13-ime patch (winit #3095 fix v3):
+                // Drop this single character. macOS's NSTextInputContext
+                // for the new IME was discarded in keyDown's
+                // input-source-change branch, so the next keyDown will
+                // be routed correctly through setMarkedText. Faking a
+                // preedit here didn't work — macOS doesn't know about
+                // it, so the following key still arrives at insertText
+                // (not setMarkedText) and gets commit-treated against
+                // our stale ivars.marked_text. Sacrificing one
+                // keystroke per language toggle is the least-bad
+                // outcome.
                 self.ivars().just_switched_input_source.set(false);
-                use objc2_foundation::NSString;
-                let ns = NSString::from_str(&string);
-                *self.ivars().marked_text.borrow_mut() =
-                    NSMutableAttributedString::from_nsstring(&ns);
-                let len = string.chars().count();
-                self.queue_event(WindowEvent::Ime(Ime::Preedit(
-                    string,
-                    Some((len, len)),
-                )));
-                self.ivars().ime_state.set(ImeState::Preedit);
+                tracing::info!(
+                    text = %string,
+                    "halite-ime: dropping first jamo after language toggle (#3095)",
+                );
             } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
                 // halite-0.30.13-ime patch (winit PR #4478):
                 // ASCII / digit "trigger" key that fires inside the same
@@ -509,27 +504,23 @@ declare_class!(
                     );
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    // halite-0.30.13-ime patch (winit #3095 fix):
-                    // The original code transitioned ime_state to
-                    // Disabled here, which caused the immediately-
-                    // following `interpretKeyEvents` to skip the IME
-                    // path. The first Korean jamo after a language
-                    // toggle then leaked as raw KeyboardInput
-                    // ("ᄒ") instead of starting composition.
-                    //
-                    // Transition to Ground and bracket the session
-                    // with Ime::Disabled/Enabled so the app's IME
-                    // state machine restarts cleanly. Also raise the
-                    // `just_switched_input_source` latch — insertText
-                    // consults it to know that a same-keyDown
-                    // insertText (which macOS often misroutes here
-                    // because the new IME hasn't fully bound) should
-                    // be treated as a preedit start rather than a
-                    // commit.
+                    // halite-0.30.13-ime patch (winit #3095 fix v3):
+                    // Forcibly reset macOS's NSTextInputContext so the
+                    // new IME's marked-text session starts clean and
+                    // the next keystroke is correctly routed through
+                    // setMarkedText (instead of insertText, the bug).
+                    // The same-keyDown first jamo is sacrificed (no
+                    // way to retroactively re-route it through the
+                    // freshly-reset IME), so just drop it. Without
+                    // this, that first key leaks as raw
+                    // KeyboardInput("ᄒ") which the app prints to grid.
                     self.ivars().ime_state.set(ImeState::Ground);
                     self.ivars().just_switched_input_source.set(true);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
                     self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                    if let Some(ctx) = self.inputContext() {
+                        ctx.discardMarkedText();
+                    }
                 }
             }
 
