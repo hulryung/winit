@@ -409,9 +409,23 @@ declare_class!(
 
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
+                // halite-0.30.13-ime patch (winit PR #4478):
+                // Clear marked text synchronously here so any second
+                // insertText: dispatched in the same interpretKeyEvents
+                // batch (Korean Space-without-preedit double-commit bug)
+                // doesn't see stale state.
+                *self.ivars().marked_text.borrow_mut() =
+                    NSMutableAttributedString::new();
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
+            } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
+                // halite-0.30.13-ime patch (winit PR #4478):
+                // ASCII / digit "trigger" key that fires inside the same
+                // keyDown as the commit (e.g. `한5` → commit "한" then
+                // insert "5"). Without this, doCommandBySelector swallows
+                // the trigger because we're still in Committed state.
+                self.ivars().forward_key_to_app.set(true);
             }
         }
 
@@ -420,12 +434,11 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
-            // We shouldn't forward any character from just committed text, since we'll end up sending
-            // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
-            // which is not desired given it was used to confirm IME input.
-            if self.ivars().ime_state.get() == ImeState::Committed {
-                return;
-            }
+            // halite-0.30.13-ime patch (winit PR #4478): removed the
+            // blanket `if ImeState::Committed { return; }` early-return
+            // so trigger keys committed via doCommandBySelector are not
+            // swallowed (Alacritty #6942). The insertText branch above
+            // already handles the same-event-as-commit case.
 
             self.ivars().forward_key_to_app.set(true);
 
@@ -447,8 +460,22 @@ declare_class!(
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    self.ivars().ime_state.set(ImeState::Disabled);
+                    // halite-0.30.13-ime patch (winit #3095 fix):
+                    // The original code transitioned ime_state to
+                    // Disabled here, which caused the immediately-
+                    // following `interpretKeyEvents` to skip the IME
+                    // path. The first Korean jamo after a language
+                    // toggle then leaked as raw KeyboardInput
+                    // ("ᄒ") instead of starting composition.
+                    //
+                    // Instead, transition to Ground and bracket the
+                    // session with Ime::Disabled/Enabled so the app's
+                    // IME state machine restarts cleanly while
+                    // interpretKeyEvents can still route this keyDown
+                    // through the new IME's setMarkedText callbacks.
+                    self.ivars().ime_state.set(ImeState::Ground);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
+                    self.queue_event(WindowEvent::Ime(Ime::Enabled));
                 }
             }
 
