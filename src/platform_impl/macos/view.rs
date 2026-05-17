@@ -919,6 +919,22 @@ impl WinitView {
 
         *this.ivars().input_source.borrow_mut() = this.current_input_source();
 
+        // halite-0.30.13-ime diagnostic: does macOS see WinitView as
+        // conforming to NSTextInputClient?
+        unsafe {
+            use objc2::msg_send;
+            use objc2::runtime::AnyProtocol;
+            if let Some(proto) = AnyProtocol::get("NSTextInputClient") {
+                let conforms: bool = msg_send![&*this, conformsToProtocol: proto];
+                tracing::info!(
+                    conforms,
+                    "halite-ime: WinitView conformsToProtocol(NSTextInputClient)",
+                );
+            } else {
+                tracing::warn!("halite-ime: AnyProtocol::get(NSTextInputClient) returned None");
+            }
+        }
+
         this
     }
 
