@@ -971,6 +971,17 @@ impl WinitView {
         }
         self.ivars().ime_allowed.set(ime_allowed);
         if self.ivars().ime_allowed.get() {
+            // halite-0.30.13-ime patch: when enabling IME, also flip
+            // ime_state out of Disabled so `is_ime_enabled()` (which
+            // reads ime_state, not ime_allowed) starts returning true
+            // immediately. Otherwise the very first keyDown skips
+            // every IME branch because is_ime_enabled() is still false
+            // — that's the surface symptom of #3095 even without a
+            // language toggle.
+            if self.ivars().ime_state.get() == ImeState::Disabled {
+                self.ivars().ime_state.set(ImeState::Ground);
+                self.queue_event(WindowEvent::Ime(Ime::Enabled));
+            }
             return;
         }
 
