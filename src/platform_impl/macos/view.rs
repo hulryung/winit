@@ -132,6 +132,15 @@ pub struct ViewState {
     forward_key_to_app: Cell<bool>,
 
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
+
+    /// halite-0.30.13-ime patch (winit #3095 fix):
+    /// True for exactly one keyDown immediately after the input source
+    /// changed. The insertText callback consults this so a single-char
+    /// insertText that races ahead of macOS binding the new IME (typical
+    /// of Korean's first jamo after a language toggle) is treated as a
+    /// preedit start instead of a commit.
+    just_switched_input_source: Cell<bool>,
+
     accepts_first_mouse: bool,
 
     // Weak reference because the window keeps a strong reference to the view
@@ -419,6 +428,31 @@ declare_class!(
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
+            } else if self.ivars().just_switched_input_source.get()
+                && self.is_ime_enabled()
+                && !is_control
+            {
+                // halite-0.30.13-ime patch (winit #3095 fix):
+                // The very first keyDown after a language toggle often
+                // arrives at insertText (not setMarkedText) because the
+                // new IME hasn't fully bound yet. Without this branch
+                // we'd silently commit it, producing the observed
+                // "first char committed instead of starting composition"
+                // bug (e.g. typing ㅎ ㅏ ㄴ commits "ㅎ" and only "한"
+                // composes). Instead, synthesize a preedit start so the
+                // app sees `Ime::Preedit(<char>)`; subsequent keys then
+                // come via setMarkedText and compose normally.
+                self.ivars().just_switched_input_source.set(false);
+                use objc2_foundation::NSString;
+                let ns = NSString::from_str(&string);
+                *self.ivars().marked_text.borrow_mut() =
+                    NSMutableAttributedString::from_nsstring(&ns);
+                let len = string.chars().count();
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(
+                    string,
+                    Some((len, len)),
+                )));
+                self.ivars().ime_state.set(ImeState::Preedit);
             } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
                 // halite-0.30.13-ime patch (winit PR #4478):
                 // ASCII / digit "trigger" key that fires inside the same
@@ -468,12 +502,17 @@ declare_class!(
                     // toggle then leaked as raw KeyboardInput
                     // ("ᄒ") instead of starting composition.
                     //
-                    // Instead, transition to Ground and bracket the
-                    // session with Ime::Disabled/Enabled so the app's
-                    // IME state machine restarts cleanly while
-                    // interpretKeyEvents can still route this keyDown
-                    // through the new IME's setMarkedText callbacks.
+                    // Transition to Ground and bracket the session
+                    // with Ime::Disabled/Enabled so the app's IME
+                    // state machine restarts cleanly. Also raise the
+                    // `just_switched_input_source` latch — insertText
+                    // consults it to know that a same-keyDown
+                    // insertText (which macOS often misroutes here
+                    // because the new IME hasn't fully bound) should
+                    // be treated as a preedit start rather than a
+                    // commit.
                     self.ivars().ime_state.set(ImeState::Ground);
+                    self.ivars().just_switched_input_source.set(true);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
                     self.queue_event(WindowEvent::Ime(Ime::Enabled));
                 }
@@ -522,6 +561,12 @@ declare_class!(
                     is_synthetic: false,
                 });
             }
+
+            // halite-0.30.13-ime patch (winit #3095 fix):
+            // The latch is strictly one-shot — clear it at end of
+            // keyDown so the next event is processed normally even if
+            // insertText didn't fire for this keyDown.
+            self.ivars().just_switched_input_source.set(false);
         }
 
         #[method(keyUp:)]
@@ -831,6 +876,7 @@ impl WinitView {
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
+            just_switched_input_source: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),
