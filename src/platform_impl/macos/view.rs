@@ -438,25 +438,32 @@ declare_class!(
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
-            } else if self.ivars().just_switched_input_source.get()
-                && self.is_ime_enabled()
-                && !is_control
-            {
-                // halite-0.30.13-ime patch (winit #3095 fix v3):
-                // Drop this single character. macOS's NSTextInputContext
-                // for the new IME was discarded in keyDown's
-                // input-source-change branch, so the next keyDown will
-                // be routed correctly through setMarkedText. Faking a
-                // preedit here didn't work — macOS doesn't know about
-                // it, so the following key still arrives at insertText
-                // (not setMarkedText) and gets commit-treated against
-                // our stale ivars.marked_text. Sacrificing one
-                // keystroke per language toggle is the least-bad
-                // outcome.
+            } else if self.is_ime_enabled() && !is_control && {
+                // Single Hangul jamo (initial/medial/final + compat
+                // jamo + extended-A/B) routed via insertText with NO
+                // marked text. That's the winit #3095 first-jamo race:
+                // macOS Korean IME occasionally hands the first
+                // composing keystroke to insertText instead of
+                // setMarkedText, so it would commit into our PTY and
+                // then the actual composed syllable (e.g. "한") also
+                // commits — producing "ㅎ한" instead of "한". Dropping
+                // the bare jamo keeps the composed syllable that
+                // follows correct.
+                let cp = string
+                    .chars()
+                    .next()
+                    .filter(|_| string.chars().count() == 1)
+                    .map(|c| c as u32)
+                    .unwrap_or(0);
+                (0x1100..=0x11FF).contains(&cp)
+                    || (0x3130..=0x318F).contains(&cp)
+                    || (0xA960..=0xA97F).contains(&cp)
+                    || (0xD7B0..=0xD7FF).contains(&cp)
+            } {
                 self.ivars().just_switched_input_source.set(false);
                 tracing::info!(
                     text = %string,
-                    "halite-ime: dropping first jamo after language toggle (#3095)",
+                    "halite-ime: dropping lone Hangul jamo insertText (#3095)",
                 );
             } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
                 // halite-0.30.13-ime patch (winit PR #4478):
